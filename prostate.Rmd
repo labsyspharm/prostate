@@ -1,0 +1,1113 @@
+---
+title: "prostate"
+output: pdf_document
+date: "2023-10-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+library(data.table)
+library(tidyr)  # For gather()
+library(tidyverse)
+library(ggplot2)
+library(survival)
+library(forestplot)
+library(survminer)
+library(umap)
+library(ggbeeswarm)
+library(ggpubr)
+library(igraph)
+library(RColorBrewer)
+library(scales)
+library(cluster)
+source("~/git/cyftools/R/helpers.R")
+source("~/Dropbox/Sorger/projects/orion/R/orion_helpers.R")
+
+generate_random_string <- function(string_length = 8) {
+  characters <- c(letters, LETTERS, 0:9)  # alphanumeric characters
+  random_string <- paste0(sample(characters, string_length, replace = TRUE), collapse = "")
+  return(random_string)
+}
+
+save_ppdf <- function(g, filename, width=10, height=10) {
+  filepath <- paste0("~/Sorger/projects/prostate/figs_raw_paper/", filename)
+  
+  pdf(filepath, useDingbats = FALSE, width, height)
+  print(g)
+  dev.off()
+}
+```
+
+```{r clinical-data}
+crr <- fread("~/Dropbox/Sorger/projects/prostate/230803_clinical_data.csv")
+crr <- crr[!duplicated(Slide_ID)]
+crr[, Gleason := ifelse(surgery_gleason %in% c("4 + 4","4 + 5","5 + 3","5 + 4"), "High", "Low")]
+crr[, Gleason2 := c("4 + 4"="8", "3 + 4"="7", "4 + 5"="5", "5 + 3"="5", "5 + 4"="5")[surgery_gleason]]
+
+setnames(crr, "surgery_lymphatic_vascular_invasion","LVI")
+setnames(crr, "surgery_seminal_vesicle","SVI")
+setnames(crr, "surgery_perineural", "PNI")
+setnames(crr, "surgery_lymph_nodes","LNI")
+crr[, any_high_risk := LNI == "Positive"  | SVI == "Positive" | LVI == "Positive"]
+
+## Fisher's exact
+table_data <- crr[, .N, by = .(Gleason, LVI)]
+contingency_table <- as.matrix(dcast(table_data, Gleason ~ LVI, value.var = "N", fill = 0)[, -1])
+fisher.test(contingency_table)
+```
+
+```{r plot-setup, include=FALSE}
+# ggplot theme
+theme_jw <- function() {
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black"),
+    panel.background = element_rect(fill = "transparent", colour = NA),
+    plot.background = element_rect(fill = "transparent", colour = NA) ,
+    text = element_text(family = "Helvetica"),
+    axis.text.x = element_text(color = "black"),
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(colour = "black"),
+    axis.ticks = element_line()
+  )
+}
+
+
+gleason_colors=c("Low"="#1b9e77","High"="#7570b3")
+
+
+```
+
+```{r master-file-list}
+master_files <- list.files(path = "~/Dropbox/Sorger/projects/prostate/chain_flip/", pattern = "cyf$", full.names = TRUE)
+```
+
+```{r cells-per-sample, include=FALSE}
+## count the total number of cells in the project
+num_cells <- sum(unlist(sapply(master_files, function(f) {
+  dt <- fread(cmd=paste("cyftools count", f))
+})))
+
+## get cell counts by type
+cell_counts_by_type <- rbindlist(lapply(master_files, function(f) {
+  cat(basename(f), "\n")
+  dt <- fread(cmd=paste("cyftools cellcount", f, "-a 34816 -a 0 -a 3072 -a 6144 -a 2052 -a 20480 -a 18432 -a 17408 - | cyftools view - -R" ))
+  setnames(dt, "34816_count", "PD1CD3_count")
+  setnames(dt, "0_count", "unclassified_count")
+  setnames(dt, "3072_count", "CD3CD4_count")
+  setnames(dt, "6144_count", "CD3CD8_count")
+  setnames(dt, "2052_count", "AMACRCD3_count")
+  setnames(dt, "20480_count", "FOXP3CD8_count")
+  setnames(dt, "18432_count", "FOXP3CD3_count")
+  setnames(dt, "17408_count", "FOXP3CD4_count")
+  dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+  return(dt)
+}))
+
+# Reshape the data to a long format and remove '_count' from Cell_Type
+long_data <- cell_counts_by_type %>%
+  select(Slide_ID, AMCAR_count, HMWCK_count, SMA_count, CD3d_count, CD8a_count, CD4_count, PD1_count, FOXP3_count, TCF1_count, CD68_count, CD163_count, CD20_count, CD11b_count, CD57_count) %>%
+  gather(key = "Cell_Type", value = "Count", -Slide_ID) %>%
+  mutate(Cell_Type = gsub("_count", "", Cell_Type))
+
+# Calculate total cells for each Slide_ID
+total_cells <- long_data %>%
+  group_by(Slide_ID) %>%
+  summarize(Total_Count = sum(Count))
+
+## merge in the clinical data
+long_data <- merge(data.table::copy(rr)[,.(Slide_ID, Gleason)], long_data, by="Slide_ID", all.x=TRUE)
+
+# Merge total cells with long data
+long_data <- merge(long_data, total_cells, by = "Slide_ID")
+
+## order the slides, first by Gleason then by total count
+ordered_slide_ids <- long_data %>%
+  arrange(Gleason, Total_Count) %>%
+  .$Slide_ID %>%
+  unique()
+long_data$Slide_ID <- factor(long_data$Slide_ID, levels = ordered_slide_ids)
+
+# Define the order of cell types within each color group
+cell_order <- c("AMCAR", "HMWCK", "SMA",   # Group A: Greens
+                "CD3d", "CD8a", "CD4", "PD1", "FOXP3", "TCF1",   # Group B: Blues
+                "CD68", "CD163", "CD20", "CD11b","CD57")  # Group C: Reds
+
+# Ensure long_data Cell_Type is in the specified order
+long_data$Cell_Type <- factor(long_data$Cell_Type, levels = cell_order)
+long_data <- as.data.table(long_data)
+
+# Define color palettes for each group
+colors <- c(rev(brewer.pal(3, "Greens")[1:3]), 
+            brewer.pal(6, "Blues")[1:6], 
+            brewer.pal(5, "Reds")[1:5])
+
+# Mapping of cell types to colors
+color_map <- setNames(colors, c("AMCAR", "HMWCK", "SMA", 
+                                "CD3d", "CD8a", "CD4", "PD1", "FOXP3", "TCF1", 
+                                "CD68", "CD163", "CD20", "CD11b","CD57"))
+
+# Create the plot
+g_cellcounts <- ggplot(long_data, aes(x = Slide_ID, y = Count/1e6, fill = Cell_Type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = color_map) +
+  coord_flip() +
+  #facet_wrap(~Gleason, scales="free_y") +
+  labs(x = "Slide ID", y = "Cell count (millions)") +
+  theme_jw() + 
+  theme(#legend.position = c(0.65, 0.3), 
+        #legend.justification = c(-0.2, -0.3), # Coordinates relative to the plot area
+        #legend.box.margin = margin(6, 6, 6, 6), # Adjust spacing around the legend box if necessary
+        #legend.margin = margin(-10, -10, -10, -10),
+        text = element_text(family = "Arial"),
+        axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title.y = element_text(size = 9, margin = margin(r = 5)),
+        axis.title.x = element_text(size = 9, margin = margin(t = 2)),
+        plot.title = element_text(size = 9),
+        legend.title = element_blank(),
+        #legend.spacing.y = unit(1, "cm"),
+        legend.text = element_text(size = 9),
+        legend.background = element_blank(),
+        legend.key = element_blank(),
+        axis.line = element_line(colour = "black"),  # Add axis lines
+        panel.background = element_rect(fill = "transparent", colour = NA),  # remove panel background
+        plot.background = element_rect(fill = "transparent", colour = NA)
+  ) +
+  #scale_y_log10(breaks = 10^seq(4), labels = trans_format("log10", scales::math_format(10^.x)))
+  scale_y_continuous(expand = c(0, 0))
+save_ppdf(g, "cell_counts_color_bar.pdf", width=5, height=4)
+
+# Calculate the fractions
+fraction_data <- long_data %>%
+  group_by(Slide_ID, Gleason) %>%
+  mutate(Total = sum(Count)) %>%
+  ungroup() %>%
+  mutate(Fraction = Count / Total)
+
+# Your ggplot code with fractions
+g <- ggplot(fraction_data, aes(x = Slide_ID, y = Fraction, fill = Cell_Type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = color_map) +
+  coord_flip() +
+  facet_wrap(~Gleason, scales = "free_y") +
+  labs(title = "Cell Type Fractions by Slide ID and Cell Type", x = "Slide ID", y = "Fraction") +
+  theme_jw()
+
+dtt <- lapply(files, function(f) {
+    dt <- fread(cmd=paste("cyftools count",f))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    return(dt)
+  })
+dtr <- rbindlist(dtt)
+dtr[, Slide_ID := factor(Slide_ID, levels = Slide_ID[order(V1)])]
+g <- ggplot(dtr, aes(x = Slide_ID, y = V1 / 1000)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +  # Makes the bar chart horizontal
+  labs(x = "Slide_ID",
+       y = "Total cell count (thousands)") + theme_jw()
+save_ppdf(g, "cell_counts_bar.pdf", width=5, height=5)
+```
+
+```{r cys-read, include=FALSE}
+
+  # read all the data as the means within the tumor compartment
+nn <- c("tumor"="-A 8", "stroma"="-N 8","all"="", "scramble_tumor"="-A 8", "scramble_stroma"="-N 8","tumor_margin"="-A 40","stroma_margin"="-A 32 -N 8","scramble_tumor_margin"="-A 40", "scramble_stroma_margin"="-A 32 -N 8","stroma_core"="-N 12", "tumor_core"="-A 8 -N 4")
+
+nn <- c("tumor"="-A 8", "stroma"="-N 8","all"="","tumor_margin"="-A 40", "tumor_core"="-A 8 -N 4")
+
+if (FALSE)
+lapply(seq_along(nn), function(n) {
+  cat("working on", names(nn)[n],"\n")
+    dtt <- parallel::mclapply(master_files, function(f) {
+      
+    #cat(basename(f), " - ", names(nn)[n], "\n")
+
+    tmpfile <- paste0("/tmp/", generate_random_string(8))
+
+    if (grepl("scramble", names(nn)[n])) {
+      ccmd=paste("cyftools scramble",f, "- | cyftools filter -", nn[n], tmpfile)
+    } else { 
+      ccmd=paste("cyftools filter",f, nn[n],tmpfile)
+    }
+    system(ccmd)
+    
+    dt <- fread(cmd=paste("cyftools mean", tmpfile, " - | cyftools view - -R"))
+
+    dt[ , allcount       := fread(cmd=paste("cyftools count", tmpfile))$V1]
+
+    # indivdual cell counts
+    drr = fread(cmd=paste("cyftools cellcount", tmpfile," - -a 34816 -a 33792 -a 65540 -a 49152 -a 0 -a 20480 -a 18432 -a 17408 -a 6144 | cyftools view - -R"))
+    dt[, amcar_count := drr$AMCAR_count]
+    dt[, hmwck_count := drr$HMWCK_count]
+    dt[, cd11c_count := drr$CD11c_count]
+    dt[, cd68count := drr$CD68_count]
+    dt[ ,cd4count. := drr$CD4_count]
+    dt[, foxp3count:= drr$FOXP3_count]
+    dt[, cd8count  := drr$CD8a_count]
+    dt[, cd20count := drr$CD20_count]
+    dt[, cd3count := drr$CD3d_count]
+    dt[, cd163count := drr$CD163_count]
+    dt[, pd1count := drr$`PD1_count`]
+    dt[, smacount := drr$SMA_count]
+    dt[ , cd3pd1count    := drr$`34816_count`]
+    dt[ , cd4pd1count    := drr$`33792_count`]
+    dt[ , uncounted    := drr$`0_count`]
+    dt[ , AMACRCD57    := drr$`65540_count`]
+    dt[ , FOXP3PD1    := drr$`49152_count`]
+    dt[,  FOXP3CD8   := drr$`20480_count`]
+    dt[, FOXP3CD3   := drr$`18432_count`]
+    dt[, FOXP3CD4  := drr$`17408_count`]
+    dt[, cd3cd8count  := drr$`6144_count`]
+
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    dt[, margin := names(nn)[n]]
+    file.remove(tmpfile)
+    return(dt)
+  }, mc.cores=8)
+  dtr <- rbindlist(dtt, fill=TRUE)
+  dtr <- dtr[!duplicated(paste(margin, Slide_ID))]
+  saveRDS(dtr, paste0("~/Dropbox/Sorger/cache/240929_prostate_",names(nn)[n], ".rds"), compress=FALSE)
+})
+
+dtr <- rbindlist(lapply(paste0("~/Dropbox/Sorger/cache/240929_prostate_",names(nn),".rds"), readRDS), fill=TRUE)
+dtr <- dtr[!duplicated(paste(margin, Slide_ID))]
+rr <- merge(data.table::copy(crr), dtr, by = "Slide_ID", all.x = TRUE)
+#fwrite(rr, "~/Dropbox/Sorger/projects/prostate/240806_prostate_data.csv", sep=",", quote=FALSE)
+
+rr[, CD8_n := cd8count / allcount]
+rr[, CD3_n := cd3count / allcount]
+rr[, FOXP3PD1_n := FOXP3PD1 / allcount]
+rr[, PD1_n := pd1count / allcount]
+rr[, FOXP3_n := foxp3count / allcount]
+rr[, FOXP3CD8_n := FOXP3CD8 / allcount]
+rr[, FOXP3CD3_n := FOXP3CD3 / allcount]
+rr[, FOXP3CD4_n := FOXP3CD4 / allcount]
+rr[, CD163_n := cd163count / allcount]
+rr[, AMCAR_n := amcar_count / allcount]
+rr[, AMACRCD57_n := AMACRCD57 / allcount]
+```
+
+```{r QC}
+dt <- fread(cmd=paste("cyftools filter -a 2048 -o -a 4096 ~/Dropbox/Sorger/projects/prostate/chain_flip_cat.cyf -  | cyftools clean -M - - | cyftools clean -m - - | cyftools view - -R"))
+
+dt[, CD8 := ifelse(bitops::bitAnd(pflag, 4096)==4096, 1, 0)]
+dt[, CD3 := ifelse(bitops::bitAnd(pflag, 2048)==2048, 1, 0)]
+dt[, SMA := ifelse(bitops::bitAnd(pflag, 32)==32, 1, 0)]
+dt[, CD4 := ifelse(bitops::bitAnd(pflag, 1024)==1024, 1, 0)]
+
+cd8_only <- nrow(dt[CD4 == 1 & CD3 == 0])
+cd3_only <- nrow(dt[CD4 == 0 & CD3 == 1])
+both_cd8_cd3 <- nrow(dt[CD4 == 1 & CD3 == 1])
+
+# Create the Venn diagram
+venn.plot <- VennDiagram::draw.pairwise.venn(
+  area1 = cd8_only + both_cd8_cd3,
+  area2 = cd3_only + both_cd8_cd3,
+  cross.area = both_cd8_cd3,
+  category = c("CD8", "CD3"),
+  scaled = TRUE,
+  fill = c("skyblue", "pink"),
+  lty = "blank",
+  cex = 2,
+  cat.cex = 2,
+  cat.pos = c(-20, 20),
+  cat.dist = c(0.05, 0.05),
+  cat.just = list(c(-1, -1), c(1, 1))
+)
+grid.draw(venn.plot)
+
+
+# Count the number of occurrences for each category
+cd8_only <- nrow(dt[CD8 == 1 & CD3 == 0 & CD4 == 0])
+cd3_only <- nrow(dt[CD8 == 0 & CD3 == 1 & CD4 == 0])
+cd4_only <- nrow(dt[CD8 == 0 & CD3 == 0 & CD4 == 1])
+cd8_cd3 <- nrow(dt[CD8 == 1 & CD3 == 1 & CD4 == 0])
+cd8_cd4 <- nrow(dt[CD8 == 1 & CD3 == 0 & CD4 == 1])
+cd3_cd4 <- nrow(dt[CD8 == 0 & CD3 == 1 & CD4 == 1])
+cd8_cd3_cd4 <- nrow(dt[CD8 == 1 & CD3 == 1 & CD4 == 1])
+
+# Create the Venn diagram
+venn.plot <- draw.triple.venn(
+  area1 = cd8_only + cd8_cd3 + cd8_cd4 + cd8_cd3_cd4,
+  area2 = cd3_only + cd8_cd3 + cd3_cd4 + cd8_cd3_cd4,
+  area3 = cd4_only + cd8_cd4 + cd3_cd4 + cd8_cd3_cd4,
+  n12 = cd8_cd3 + cd8_cd3_cd4,
+  n13 = cd8_cd4 + cd8_cd3_cd4,
+  n23 = cd3_cd4 + cd8_cd3_cd4,
+  n123 = cd8_cd3_cd4,
+  category = c("CD8", "CD3", "CD4"),
+  fill = c("skyblue", "pink", "lightgreen"),
+  lty = "blank",
+  cex = 2,
+  cat.cex = 2,
+  cat.col = c("skyblue", "pink", "lightgreen"),
+  cat.pos = c(-20, 20, 160),
+  cat.dist = c(0.05, 0.05, 0.05),
+  cat.just = list(c(-1, -1), c(1, 1), c(1, 1))
+)
+```
+
+```{r whole-slide-bees}
+rrt = rr[margin=="all"]
+rrm <- melt(rrt, id.vars=c("Slide_ID","Gleason"), measure.vars=c("CD8a_50r","CD3d_50r", "CD4_50r","CD20_50r","CD68_50r","CD163_50r"))
+g <- create_beeswarm_plot(rrm, x_var="Gleason", y_var="value", withbox=TRUE) + 
+  facet_wrap(~ variable, scale="free") + 
+  scale_fill_manual(values=gleason_colors)
+```
+
+```{r tls-counts}
+mfiles <- list.files(path = "~/Sorger/projects/prostate/tls/", pattern = "cyf$", full.names = TRUE)
+drr <- parallel::mclapply(mfiles, function(f) {
+   dt <- fread(cmd=paste("cyftools view",f,"-x tls_id | cut -d',' -f 7 | sort -n | uniq | wc -l"))
+   dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+}, mc.cores=8)
+tls <- rbindlist(drr)
+setnames(tls, "V1","TLS_count")
+tls[, TLS_count := TLS_count - 1] ## 0 is not a TLS
+rr <- merge(rr, tls, by="Slide_ID", all.x=TRUE)
+```
+
+```{r cd-waterfall}
+rrt = rr[margin=="all"] ## & !Slide_ID %in% c("LSP12645","LSP12643","LSP12631")]
+# "ratio" is not good term, but it's the field we'll be looking at for this plot
+rrt[, ratio := CD3d_50r]
+setkeyv(rrt, "ratio")
+clevels <- rrt$Slide_ID
+rrt[, Slide_ID := factor(Slide_ID, levels=clevels)]
+rrt[, samplecount := seq(.N)]
+g <- ggplot(rrt, aes(x=Slide_ID, y=ratio, fill=Gleason)) + 
+  geom_bar(stat="identity", color="black") + ylab("Cells / mm2") + xlab("Sample ID") +
+  coord_flip() +  scale_fill_manual(values=gleason_colors) + theme_jw() + 
+  theme(axis.line = element_line(), axis.ticks = element_line()) + 
+   theme(legend.position = c(0.65, 0.3), 
+        legend.justification = c(-0.2, -0.3), # Coordinates relative to the plot area
+        legend.box.margin = margin(6, 6, 6, 6), # Adjust spacing around the legend box if necessary
+        legend.margin = margin(-10, -10, -10, -10),
+        text = element_text(family = "Helvetica"),
+        axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title.y = element_text(size = 9, margin = margin(r = 5)),
+        axis.title.x = element_text(size = 9, margin = margin(t = 2)),
+        plot.title = element_text(size = 9),
+        legend.title = element_blank(),
+        #legend.spacing.y = unit(1, "cm"),
+        legend.text = element_text(size = 9),
+        legend.background = element_blank(),
+        legend.key = element_blank(),
+        axis.line = element_line(colour = "black"),  # Add axis lines
+        panel.background = element_rect(fill = "transparent", colour = NA),  # remove panel background
+        plot.background = element_rect(fill = "transparent", colour = NA)
+  ) +
+  #scale_x_continuous(expand=c(0,0), breaks=c(0,10,20,30,40,50,60,70)) + 
+  scale_y_continuous(expand=c(0,0))
+save_ppdf(g, "cd8_waterfall_whole_slide.pdf", width=5, height=4)
+```
+
+```{r compare-compartments-counts}
+
+tumorn="tumor_core"
+stroman="stroma_core"
+tumorns="stroma_core"
+stromans="tumor_core"
+
+# Reshape the data to long format for ggplot
+long_data <- as.data.table(rr %>%
+  gather(key = "Cell_Type", value = "Value", CD8a_50r, CD3d_50r, PD1_50r, FOXP3_50r, AMCAR_50r, CD163_50r,
+         CD8_n, CD3_n, FOXP3PD1_n,PD1_n, FOXP3_n, AMCAR_n, CD163_n,AMACRCD57_n) %>%
+  mutate(Gleason = factor(Gleason, levels = c("Low", "High"))))
+
+# Calculate the ratio (tumor)
+ratio_data <- long_data[margin %in% c(tumorn, tumorns), .(
+    tumor_normalized = Value[margin == tumorn] / Value[margin == tumorns]
+  ), by = .(Cell_Type, Slide_ID)
+]
+
+# Join ratio_data back to long_data for rows where margin is "A8"
+new_rows <- long_data[margin == tumorn, on = .(Cell_Type, Slide_ID)]
+
+# Merge the calculated ratios into new_rows
+new_rows <- merge(new_rows, ratio_data, by = c("Cell_Type", "Slide_ID"))
+
+# Update the margin and Value columns in new_rows
+new_rows[, `:=`(margin = "tumor_normalized", Value = tumor_normalized)]
+
+
+# Calculate the ratio (stroma)
+ratio_data <- long_data[margin %in% c(stroman, stromans), .(
+    stroma_normalized = Value[margin == stroman] / Value[margin == stromans]
+  ), by = .(Cell_Type, Slide_ID)
+]
+
+# Join ratio_data back to long_data for rows where margin is "A8"
+new_rows_s <- long_data[margin == stroman, on = .(Cell_Type, Slide_ID)]
+
+# Merge the calculated ratios into new_rows
+new_rows_s <- merge(new_rows, ratio_data, by = c("Cell_Type", "Slide_ID"))
+
+# Update the margin and Value columns in new_rows
+new_rows_s[, `:=`(margin = "stroma_normalized", Value = stroma_normalized)]
+
+# Add the new rows to the original data.table
+long_data <- rbind(long_data, new_rows, new_rows_s, fill = TRUE)
+
+
+long_data <- long_data[margin %in% c(tumorn,"all",stroman,"tumor_normalized","stroma_normalized")]
+
+# Create an interaction variable for margin and Gleason
+long_data$Margin_Gleason <- with(long_data, factor(interaction(margin, Gleason, sep = "-"),
+                                                    levels = c("all-Low", "all-High", 
+                                                               paste0(tumorn, c("-Low","-High")),
+                                                               paste0(stroman,c("-Low","-High")),
+                                                               paste0("tumor_normalized",c("-Low","-High")),
+                                                               paste0("stroma_normalized",c("-Low","-High")))))
+long_data <- long_data[!(Slide_ID == "LSP12657" & Cell_Type =="CD8a_20r") & 
+                       !(Slide_ID == "LSP12629" & Cell_Type =="CD20_20r") &
+                       !(Slide_ID == "LSP12629" & Cell_Type =="CD163_20r")]
+
+# Define colors for each margin and Gleason level
+# Define the main categories and their low and high variants
+categories <- c(tumorn, "all",stroman, "tumor_normalized","stroma_normalized")
+variants <- c("Low", "High")
+
+# Create a diverging color palette for each main category
+# Adjust the number of colors based on your specific needs
+palette_A8 <- brewer.pal(3, "Reds")[c(1,3)]
+palette_all <- brewer.pal(3, "Greens")[c(1,3)]
+palette_N8 <- brewer.pal(3, "Blues")[c(1,3)]
+palette_scramble <- brewer.pal(3, "Purples")[c(1,3)]
+palette_stroma_scramble <- brewer.pal(3, "Greys")[c(1,3)]
+
+# Combine the palettes
+colors <- c(palette_A8, palette_all, palette_N8, palette_scramble, palette_stroma_scramble)
+
+# Construct the final color mapping
+margin_colors <- setNames(colors, paste0(rep(categories, each = length(variants)), "-", variants))
+
+# Extract the corresponding names, which are the LSP numbers
+lsp_numbers = names(master_files)
+
+g <- ggplot(long_data[Cell_Type %in% 
+                        c("CD3_n","CD8_n","FOXP3_n","PD1_n","AMCAR_n","CD163_n","AMACRCD57_n") & 
+                        #c("CD8a_50r", "CD3d_50r", "PD1_50r", "FOXP3_50r", "AMCAR_50r", "CD163_50r") & 
+                        !Slide_ID %in% c("LSP12631","LSP12643","LSP12645") & 
+                        grepl("normalized", Margin_Gleason)], aes(x = Margin_Gleason, y = Value, fill = Margin_Gleason)) +
+  geom_boxplot(position = position_dodge2(width = 0.8, preserve = "single")) +
+  scale_fill_manual(values = margin_colors) +
+  facet_wrap(~ Cell_Type, nrow=1) +
+  scale_y_log10() + 
+  labs(title = "Boxplots by Cell Type, Margin, and Gleason", x = "Margin - Gleason", y = "Fold-increase") +
+ # coord_cartesian(ylim = c(0, 3.5)) +  # Set y-axis limits
+  theme_jw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1))+
+    scale_x_discrete(labels = function(x) {
+    ifelse(x == "tumor_normalized−Low", "Tumor-Low",
+    ifelse(x == "tumor_normalized−High", "Tumor-High",
+    ifelse(x == "stroma_normalized−Low", "Stroma-Low",
+    ifelse(x == "stroma_normalized−High", "Stroma-High", x))))
+  }) +
+  geom_hline(aes(yintercept=1))
+
+dtw <- rbindlist(lapply(c("tumor_normalized","stroma_normalized","all","tumor_margin","stroma_margin"), function(mn) {
+  rbindlist(lapply(c("CD8a_50r", "CD3d_50r", "PD1_50r", "FOXP3_50r", "AMCAR_50r", "CD163_50r"), function(cell) {
+a = long_data[Cell_Type == cell & !Slide_ID %in% c("LSP12631","LSP12643","LSP12645") & Gleason == "High" & margin==mn, Value]
+b = long_data[Cell_Type == cell & !Slide_ID %in% c("LSP12631","LSP12643","LSP12645") & Gleason == "Low" & margin==mn, Value]
+data.table(p=wilcox.test(a,b)$p.value, margin=mn, cell=cell)
+}))
+  }))
+
+dtw <- rbindlist(lapply(c("tumor_normalized","stroma_normalized","all","tumor_core","stroma_core"), function(mn) {
+  rbindlist(lapply(c("AMACRCD57_n","AMCAR_n","CD163_n","CD3_n","CD8_n","FOXP3_n","PD1_n"), function(cell) {
+a = long_data[Cell_Type == cell & !Slide_ID %in% c("LSP12631","LSP12643","LSP12645") & Gleason == "High" & margin==mn, Value]
+b = long_data[Cell_Type == cell & !Slide_ID %in% c("LSP12631","LSP12643","LSP12645") & Gleason == "Low" & margin==mn, Value]
+data.table(p=t.test(a,b)$p.value, margin=mn, cell=cell)
+}))
+  }))
+
+save_ppdf(g, "tumor_v_stroma_boxplots_tumor.pdf", width=8, height=4)
+```
+
+```{r adaptive-beeswarm}
+rrt = rr[margin=="all"]
+tcol <- c("CD4","CD3d","CD8a","FOXP3","CD20")
+rrp <- rrt[, .SD, .SDcols = c(paste0(tcol,"_50r"), "Gleason","Slide_ID")]
+rrm <- data.table::melt(rrp, id.vars = c("Gleason","Slide_ID"))
+rrm <- rrm[!(Slide_ID == "LSP12657" & variable=="CD8a_50r")][!(Slide_ID == "LSP12629" & variable=="CD20_50r")][!(Slide_ID == "LSP12629" & variable=="CD163_50r")]
+g <- create_beeswarm_plot(rrm, x="Gleason", y="value", withbox=TRUE) +
+  facet_wrap(rrm$variable, scales="free", nrow=1) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  theme(
+  strip.background = element_blank(),
+  strip.text = element_text(face = "bold", size = 10) 
+) + ylab("Cell Density (cells/mm2)") + 
+   theme(text = element_text(family = "Helvetica"),
+        axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title.y = element_text(size = 9, margin = margin(r = 5)),
+        axis.title.x = element_text(size = 9, margin = margin(t = 2)),
+        plot.title = element_text(size = 9),
+        panel.background = element_rect(fill = "transparent", colour = NA),  # remove panel background
+        plot.background = element_rect(fill = "transparent", colour = NA)
+  ) 
+save_ppdf(g, "innate_beeswarm.pdf", width=6, height=1.8)
+```
+
+```{r cd57-beeswarm}
+rrt = rr[margin=="stroma",]
+tcol <- c("FOXP3CD3_n","FOXP3CD8_n","FOXP3CD4_n")
+#rrp <- rrt[, .SD, .SDcols = c(paste0(tcol,"_50r"), "Gleason","Slide_ID")]
+rrp <- rrt[, .SD, .SDcols = c(tcol, "Gleason","Slide_ID")]
+rrm <- data.table::melt(rrp, id.vars = c("Gleason","Slide_ID"))
+rrm <- rrm[!(Slide_ID == "LSP12657" & variable=="CD8a_50r")][!(Slide_ID == "LSP12629" & variable=="CD20_50r")][!(Slide_ID == "LSP12629" & variable=="CD163_50r")]
+g <- create_beeswarm_plot(rrm, x="Gleason", y="value", withbox=TRUE) +
+  facet_wrap(rrm$variable, scales="free", nrow=1) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  theme(
+  strip.background = element_blank(),
+  strip.text = element_text(face = "bold", size = 10) 
+) + ylab("Cell Density (cells/mm2)") + 
+   theme(text = element_text(family = "Helvetica"),
+        axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title.y = element_text(size = 9, margin = margin(r = 5)),
+        axis.title.x = element_text(size = 9, margin = margin(t = 2)),
+        plot.title = element_text(size = 9),
+        panel.background = element_rect(fill = "transparent", colour = NA),  # remove panel background
+        plot.background = element_rect(fill = "transparent", colour = NA)
+  ) 
+save_ppdf(g, "cd57amcar_beeswarm.pdf", width=2, height=1.8)
+```
+
+```{r foxp3-beeswarm}
+rrt = rr[margin=="all",]
+tcol <- c("FOXP3","PD1","CD163")
+rrp <- rrt[, .SD, .SDcols = c(paste0(tcol,"_50r"), "Gleason","Slide_ID")]
+#rrp <- rrt[, .SD, .SDcols = c(tcol, "Gleason","Slide_ID")]
+rrm <- data.table::melt(rrp, id.vars = c("Gleason","Slide_ID"))
+rrm <- rrm[!(Slide_ID == "LSP12657" & variable=="CD8a_50r")][!(Slide_ID == "LSP12629" & variable=="CD20_50r")][!(Slide_ID == "LSP12629" & variable=="CD163_50r")]
+g <- create_beeswarm_plot(rrm, x="Gleason", y="value", withbox=TRUE) +
+  facet_wrap(rrm$variable, scales="free", nrow=1) + 
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  theme(
+  strip.background = element_blank(),
+  strip.text = element_text(face = "bold", size = 10) 
+) + ylab("Cell Density (cells/mm2)") + 
+   theme(text = element_text(family = "Helvetica"),
+        axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black"),
+        axis.title.y = element_text(size = 9, margin = margin(r = 5)),
+        axis.title.x = element_text(size = 9, margin = margin(t = 2)),
+        plot.title = element_text(size = 9),
+        panel.background = element_rect(fill = "transparent", colour = NA),  # remove panel background
+        plot.background = element_rect(fill = "transparent", colour = NA)
+  ) 
+save_ppdf(g, "innate_beeswarm_stroma.pdf", width=4, height=1.8)
+```
+
+```{r tls-pd1} 
+rrt = rr[margin=="all",]
+g <- ggplot(rrt, aes(x=SMA_50r, y=TLS_count, color=Gleason, fill=Gleason)) + 
+  theme_jw() + geom_point() + 
+    geom_smooth(method = "lm", se = TRUE) +  # Add linear regression line for each group
+  scale_color_manual(values=gleason_colors) + 
+  scale_fill_manual(values=gleason_colors) + 
+  xlab("CD3+PD1+ cells/mm2") + ylab("Tertiary Lymphoid Structures (count per sample)")
+save_ppdf(g, "tls_pd1_correlation.pdf", width=3, height=3)
+```
+
+```{r compare-compartments}
+
+# Reshape the data to long format for ggplot
+long_data <- as.data.table(rr[!is.na(margin) & margin %in% c("all","A8","N8","tumor_margin","tumor_stroma")] %>%
+  gather(key = "Cell_Type", value = "Value", CD3d_20r, CD20_20r, CD8a_20r,
+         AMCAR_20r, CD57_20r, CD163_20r, PD1_20r, CD8a_20r, FOXP3_20r, HLAA_20r, HLADR_20r,
+         CD8_n, CD3_n, FOXP3PD1_n) %>%
+  mutate(Gleason = factor(Gleason, levels = c("Low", "High"))))
+
+# Create an interaction variable for margin and Gleason
+long_data$Margin_Gleason <- with(long_data, factor(interaction(margin, Gleason, sep = "-"),
+                                                    levels = c("all-Low", "all-High", "A8-Low", "A8-High","N8-Low", "N8-High","tumor_stroma-Low","tumor_stroma-High","tumor_margin-Low","tumor_margin-High")
+                                                    
+                                                   ))
+long_data <- long_data[!(Slide_ID == "LSP12657" & Cell_Type =="CD8a_20r") & 
+                       !(Slide_ID == "LSP12629" & Cell_Type =="CD20_20r") &
+                       !(Slide_ID == "LSP12629" & Cell_Type =="CD163_20r")]
+
+# Define colors for each margin and Gleason level
+# Define the main categories and their low and high variants
+categories <- c("A8", "all", "N8","tumor_stroma","tumor_margin")
+variants <- c("Low", "High")
+
+# Create a diverging color palette for each main category
+# Adjust the number of colors based on your specific needs
+palette_A8 <- brewer.pal(3, "Reds")[c(1,3)]
+palette_all <- brewer.pal(3, "Greens")[c(1,3)]
+palette_N8 <- brewer.pal(3, "Blues")[c(1,3)]
+palette_ts <- brewer.pal(3, "Purples")[c(1,3)]
+palette_tm <- brewer.pal(3, "Greys")[c(1,3)]
+
+# Combine the palettes
+colors <- c(palette_A8, palette_all, palette_N8, palette_ts, palette_tm)
+
+# Construct the final color mapping
+margin_colors <- setNames(colors, paste0(rep(categories, each = length(variants)), "-", variants))
+
+g <- ggplot(long_data[Cell_Type %in% c("CD8a_20r")], aes(x = Margin_Gleason, y = Value, fill = Margin_Gleason)) +
+  geom_boxplot(position = position_dodge2(width = 0.8, preserve = "single")) +
+  scale_fill_manual(values = margin_colors) +
+  facet_wrap(~ Cell_Type, nrow=1) +
+  labs(title = "Boxplots by Cell Type, Margin, and Gleason", x = "Margin - Gleason", y = "Cells / mm2") +
+  coord_cartesian(ylim = c(0, 2300)) +  # Set y-axis limits
+  theme_jw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1))
+
+# calculate the wilcox p values
+variables <- c("FOXP3_20r", "CD8a_20r", "PD1_20r", "CD163_20r","CD4_20r","CD103_20r", 
+               "CD20_20r")
+margins <- c("all", "N8", "A8")
+rr_subset <- rr[!is.na(margin) & Slide_ID != "LSP12629",]
+results <- rbindlist(lapply(variables, function(A) {
+  rbindlist(lapply(margins, function(B) {
+    data.table(
+      Cell = sub("_20r", "", A),
+      Compartment = c("all"="Whole slide", "N8"="Stroma","A8"="Tumor")[B],
+      p_value = t.test(
+        rr_subset[margin == B & Gleason == "Low", get(A)],
+        rr_subset[margin == B & Gleason == "High", get(A)]
+      )$p.value,
+      LG_median = round(rr_subset[margin == B & Gleason == "Low", mean(get(A), na.rm = TRUE)])/1000,
+      HG_median = round(rr_subset[margin == B & Gleason == "High", mean(get(A), na.rm = TRUE)])/1000
+    )
+  }))
+}))
+
+results <- results[, c("Cell", "Compartment", "LG_median", "HG_median", "p_value")]
+digits <- rep(2, ncol(results)+1)
+digits[6] <- 4
+latex_table <- xtable(results, digits = digits)
+print(latex_table, include.rownames = FALSE, hline.after = c(-1, 0, nrow(data)))
+
+# Write to CSV
+fwrite(results, file = "~/Sorger/projects/prostate/formatted_results.csv")
+
+save_ppdf(g, "boxplot_region_compar.pdf", width=8, height=8)
+```
+
+```{r 20r-boxplots}
+rr_long <- melt(rr, id.vars = "Gleason", measure.vars = c("FOXP3_20r","HLAA_20r"), variable.name = "Metric", value.name = "Value")
+rr_long[, cells_per_mm2 := Value * 1e6 / (1000^2 * 0.325^2)]
+
+# Assuming the data has two Gleason groups "A" and "B"
+get_pvalue <- function(data){
+  wilcox.test(data[data$Gleason == "High",]$cells_per_mm2, 
+         data[data$Gleason == "Low",]$cells_per_mm2)$p.value
+}
+p_values <- by(rr_long, rr_long$Metric, get_pvalue)
+
+labels_with_pvalues <- sapply(names(p_values), function(name) {
+    sprintf("%s (p = %.3f)", name, p_values[[name]])
+})
+
+g <- ggplot(rr_long, aes(x = Gleason, y = cells_per_mm2 / 1000, fill = Gleason)) +
+  geom_boxplot(alpha = 0.5, width=0.8, outlier.shape=NA) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 1, alpha = 0.7, shape=20) +
+  labs(y = "Thousands of cells / mm2") +
+  #scale_fill_manual(values = pMMR_colors) +
+  facet_wrap(~ Metric, labeller = as_labeller(labels_with_pvalues)) +
+  theme_jw() + scale_y_log10()
+save_ppdf(g, "whole_slide_immune_boxplot2.pdf", width=6, height=4)
+```
+
+```{r clinical_plots}
+g <- ggplot(rr, aes(x = Gleason, y = age_surgery_years, fill = Gleason)) +
+  geom_boxplot(alpha = 0.5, width=0.8, outlier.shape=NA) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 1, alpha = 0.7, shape=20) +
+  labs(y = "Age at surgery (years)") +
+  theme_jw() 
+wilcox.test(rr[Gleason=="High",time_to_progression_days], rr[Gleason=="Low",time_to_progression_days])
+save_ppdf(g, "age_boxplot.pdf", width=3, height=3)
+```
+
+```{r cohort-statistic}
+system(paste("cyftools cellcount ~/Sorger/projects/prostate/allp.cys /tmp/tmp.cys -a 34816 -a 0"), intern=TRUE)
+headr <- header_read("/tmp/tmp.cys")
+dt <- fread(cmd=paste("cyftools view /tmp/tmp.cys"))
+colnames(dt) <- c("sid","cid","cflag","pflag","x","y",headr[tag_type %in% c("CA","MA"), id])
+
+# Gather the count fields to long format
+dt_long <- dt[, .(Variable = names(.SD), Count = unlist(.SD)), 
+              .SDcols = patterns("_count")]
+dt_long$Variable <- gsub("_count$", "", dt_long$Variable)
+dt_long$Variable[dt_long$Variable=="0"] <- "Uncalled"
+dt_long$Variable[dt_long$Variable=="34816"] <- "CD3+PD1+"
+
+# Plot using ggplot2
+g <- ggplot(dt_long, aes(x = Variable, y = Count / 29 / 1000)) +
+  geom_bar(stat = "identity") +
+  coord_flip() + # Flip to make horizontal bars
+  theme_minimal() +
+  labs(x = "", y = "Cell counts / tumor (thousands)") + 
+  scale_y_continuous(labels = scales::comma) + # Use comma format for y-axis labels
+  theme_jw()
+save_ppdf(g, "cell_counts_hist.pdf", width=6, height=6)
+```
+
+
+```{r umap}
+dt <- fread("cyftools clean -M ~/Sorger/projects/prostate/allp.02.cys - | cyftools rescale - - | cyftools view - -R")[,.(Ki67, AMCAR, HMWCK, CD19, SMA, CD20, CD68, CD163, CD4, CD3d, CD8a, FOXP3, PD1, CD57, CD11c, GranzymeB, CD15, HLADR, CD103, CD31, pTBK1, HLAA, CD44, CD206)]
+expm <- t(as.matrix(dt[sample(.N, 99000)]))
+colnames(expm) <- seq(ncol(expm))
+seurat_obj <- CreateSeuratObject(counts = expm)
+
+# pre-process
+seurat_obj <- NormalizeData(seurat_obj)
+#seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj, verbose = FALSE, npcs = min(10, ncol(seurat_obj) - 1), features = rownames(seurat_obj))
+
+ElbowPlot(seurat_obj)
+
+# cluster using Louvain
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:10)  # you can choose an appropriate number of dims based on ElbowPlot
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)  # adjust resolution based on the desired granularity
+saveRDS(seurat_obj, "~/Sorger/cache/seurat.rds", compress=FALSE)
+
+# run umap
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:10, n_neighbors = 30, min_dist = 0.5)
+DimPlot(seurat_obj, group.by = "seurat_clusters")
+```
+
+```{r macrophage-tcell}
+files <- list.files(path = "~/Sorger/projects/prostate/chain/", full.names = TRUE)
+files <- files[grepl("cys$", files)]
+dtt <- lapply(files, function(f) {
+    cat(basename(f), "\n")
+    dt <- fread(cmd=paste("cyftools filter -a 512 -a 256 -T",f,"/tmp/tmp.cys && cyftools mean /tmp/tmp.cys - | cyftools view - -R"))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    dt[, margin := "cd163"]
+    return(dt)
+  })
+dtr <- rbindlist(dtt)
+
+dtt <- lapply(files, function(f) {
+    cat(basename(f), "\n")
+    dt <- fread(cmd=paste("cyftools filter -n 768 -T",f,"/tmp/tmp.cys && cyftools mean /tmp/tmp.cys - | cyftools view - -R"))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    dt[, margin := "not_cd163"]
+    return(dt)
+  })
+dtr <- rbind(dtr, rbindlist(dtt))
+  
+rrm <- fread("~/Sorger/projects/prostate/230803_clinical_data.csv")
+rrm <- rrm[!duplicated(Slide_ID)]
+rrm[, Gleason := ifelse(surgery_gleason %in% c("4 + 4","4 + 5","5 + 3","5 + 4"), "High", "Low")]
+rrm <- merge(data.table::copy(rrm), dtr, by = "Slide_ID", all.x = TRUE)
+
+rr_long <- melt(rrm, id.vars = c("Gleason","margin"), measure.vars = c("CD3d_20r","CD4_20r","CD8a_20r","PD1_20r"), variable.name = "Metric", value.name = "Value")
+rr_long[, cells_per_mm2 := Value * 1e6 / (1000^2 * 0.325^2)]
+p_values <- by(rr_long, rr_long$Metric, get_pvalue)
+labels_with_pvalues <- sapply(names(p_values), function(name) {
+    sprintf("%s (p = %.3f)", name, p_values[[name]])
+})
+
+g <- ggplot(rr_long, aes(x = margin, y = cells_per_mm2 / 1000, fill = Gleason)) +
+  geom_boxplot(alpha = 0.5, width=0.8, outlier.shape=NA) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 1, alpha = 0.7, shape=20) +
+  labs(y = "Thousands of cells / mm2") +
+  #scale_fill_manual(values = pMMR_colors) +
+  facet_wrap(~ Metric, labeller = as_labeller(labels_with_pvalues)) +
+  theme_jw() + scale_y_log10()
+```
+
+```{r lda}
+files <- list.files(path = "~/Sorger/projects/prostate/lda", full.names = TRUE)
+files <- files[grepl("cys$", files)]
+dtt <- lapply(files, function(f) {
+    cat(basename(f), "\n")
+    dt <- fread(cmd=paste("cyftools filter",f,"/tmp/tmp.cys && cyftools mean /tmp/tmp.cys - | cyftools view - -R"))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    #dt[, margin := "cd163"]
+    return(dt)
+  })
+dtr <- rbindlist(dtt)
+
+rr <- fread("~/Sorger/projects/prostate/230803_clinical_data.csv")
+rr <- rr[!duplicated(Slide_ID)]
+rr[, Gleason := ifelse(surgery_gleason %in% c("4 + 4","4 + 5","5 + 3","5 + 4"), "High", "Low")]
+rr <- merge(data.table::copy(rr), dtr, by = "Slide_ID", all.x = TRUE)
+
+rr_long <- melt(rr, id.vars = "Gleason", measure.vars = paste0("topic",seq(10)), variable.name = "Metric", value.name = "Value")
+#rr_long[, cells_per_mm2 := Value * 1e6 / (1000^2 * 0.325^2)]
+
+# Assuming the data has two Gleason groups "A" and "B"
+get_pvalue <- function(data) {
+  wilcox.test(data[data$Gleason == "High",]$Value, 
+         data[data$Gleason == "Low",]$Value)$p.value
+}
+p_values <- by(rr_long, rr_long$Metric, get_pvalue)
+
+labels_with_pvalues <- sapply(names(p_values), function(name) {
+    sprintf("%s (p = %.3f)", name, p_values[[name]])
+})
+
+g <- ggplot(rr_long, aes(x = Gleason, y = Value, fill = Gleason)) +
+  geom_boxplot(alpha = 0.5, width=0.8, outlier.shape=NA) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 1, alpha = 0.7, shape=20) +
+  labs(y = "Thousands of cells / mm2") +
+  #scale_fill_manual(values = pMMR_colors) +
+  facet_wrap(~ Metric, labeller = as_labeller(labels_with_pvalues)) +
+  theme_jw() + scale_y_log10()
+save_ppdf(g, "lda_boxplots.pdf", width=6, height=6)
+```
+
+```{r scramble-lda}
+files <- list.files(path = "~/Sorger/projects/prostate/scramble", full.names = TRUE)
+files <- files[grepl("scramble.ptrdl.cys$", files)]
+dtt <- lapply(files, function(f) {
+    cat(basename(f), "\n")
+    dt <- fread(cmd=paste("cyftools filter",f,"/tmp/tmp.cys && cyftools mean /tmp/tmp.cys - | cyftools view - -R"))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    #dt[, margin := "cd163"]
+    return(dt)
+  })
+dtr <- rbindlist(dtt)
+
+rr <- fread("~/Sorger/projects/prostate/230803_clinical_data.csv")
+rr <- rr[!duplicated(Slide_ID)]
+rr[, Gleason := ifelse(surgery_gleason %in% c("4 + 4","4 + 5","5 + 3","5 + 4"), "High", "Low")]
+rr <- merge(data.table::copy(rr), dtr, by = "Slide_ID", all.x = TRUE)
+
+rr_long <- melt(rr, id.vars = "Gleason", measure.vars = paste0("topic",seq(10)), variable.name = "Metric", value.name = "Value")
+#rr_long[, cells_per_mm2 := Value * 1e6 / (1000^2 * 0.325^2)]
+
+# Assuming the data has two Gleason groups "A" and "B"
+get_pvalue <- function(data) {
+  wilcox.test(data[data$Gleason == "High",]$Value, 
+         data[data$Gleason == "Low",]$Value)$p.value
+}
+p_values <- by(rr_long, rr_long$Metric, get_pvalue)
+
+labels_with_pvalues <- sapply(names(p_values), function(name) {
+    sprintf("%s (p = %.3f)", name, p_values[[name]])
+})
+
+g <- ggplot(rr_long, aes(x = Gleason, y = Value, fill = Gleason)) +
+  geom_boxplot(alpha = 0.5, width=0.8, outlier.shape=NA) +
+  geom_jitter(position = position_jitter(width = 0.2), size = 1, alpha = 0.7, shape=20) +
+  labs(y = "Thousands of cells / mm2") +
+  #scale_fill_manual(values = pMMR_colors) +
+  facet_wrap(~ Metric, labeller = as_labeller(labels_with_pvalues)) +
+  theme_jw() + scale_y_log10()
+```
+
+```{r jaccard}
+ff <- c("/Users/jeremiahwala/Sorger/projects/prostate/chain/low.cys","/Users/jeremiahwala/Sorger/projects/prostate/chain/high.cys")
+#dtt <- lapply(master_files, function(f) {
+dtt <- lapply(ff, function(f) {
+    cat(basename(f), "\n")
+    dt <- fread(cmd=paste("cyftools jaccard",f,"-j"))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    #dt[, margin := "cd163"]
+    return(dt)
+  })
+dtr <- rbindlist(dtt)
+ 
+# scrambled
+files <- list.files(path = "~/Sorger/projects/prostate/clean/", full.names = TRUE)
+files <- files[grepl("cys$", files)]
+
+#dtt <- lapply(files, function(f) {
+dtt <- lapply(ff, function(f) {
+  cat(basename(f),"\n")
+dt <- rbindlist(mclapply(seq(5), function(s) {
+    dt <- fread(cmd=paste("cyftools scramble -s",s, f,"- | cyftools jaccard - -j"))
+    dt[, Slide_ID := sub("^(LSP[0-9]+).*", "\\1", basename(f))]
+    dt[, seed := s]
+    return(dt)
+  }, mc.cores=5))
+  dt[, V3_scramble := mean(V3, na.rm = TRUE), by = c("V1","V2","Slide_ID")]
+  return(dt[!duplicated(paste(Slide_ID,V1,V2)), .(V1,V2,Slide_ID,V3_scramble)])
+})
+dtr_s <- rbindlist(dtt)
+saveRDS(dtr_s, "~/cache/dtr_s_high_low_jaccard.rds", compress=FALSE)
+
+# merged dtr
+dtr <- merge(dtr, dtr_s[, .(V1, V2, Slide_ID, V3_scramble)], by = c("V1", "V2", "Slide_ID"))
+dtr[, Jaccard_score_normalized := V3 / V3_scramble]
+
+# Create a mirrored dataset by switching V1 and V2
+mirrored_dtr <- dtr[, .(V1 = V2, V2 = V1, Slide_ID = Slide_ID, V3 = V3, Jaccard_score_normalized = Jaccard_score_normalized)]
+
+# Combine the original and mirrored datasets
+combined_dtr <- rbind(dtr[,.(V1, V2, V3, Slide_ID, Jaccard_score_normalized)], mirrored_dtr[,.(V1, V2, V3, Slide_ID, Jaccard_score_normalized)])
+
+# Convert data.table to wide format
+wide_dtr <- dcast(combined_dtr, V1 + Slide_ID ~ V2, value.var = "Jaccard_score_normalized")
+
+# Convert wide format to long format
+long_dtr <- melt(wide_dtr, id.vars = c("V1", "Slide_ID"))
+
+# Convert V1 and variable to character
+long_dtr[, V1 := as.character(V1)]
+long_dtr[, variable := as.character(variable)]
+
+# Filter out the lower diagonal
+long_dtr <- long_dtr[V1 < variable]
+
+# if jaccard normalized
+long_dtr[, value_maxed := ifelse(value > 50, 50, value)]
+
+# Plot heatmap using ggplot2
+tcell <- c("CD3d","CD4","CD8a","PD1","FOXP3","AMCAR","SMA","CD20","CD57")
+g <- ggplot(long_dtr[V1 %in% tcell & variable %in% tcell], aes(x = V1, y = variable)) +
+  geom_tile(aes(fill = log10(value_maxed)), color = "black") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(title = "Jaccard Correlation Enrichment", x="",y="",fill = "Correlation") +
+  theme_jw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  facet_wrap(~ Slide_ID) +
+  coord_fixed(clip = "off") +
+  theme(plot.margin = margin(1, 1, 1, 1, "cm")) 
+save_ppdf(g, "jaccard_tcell.pdf", width=5, height=4)
+```
+
+```{r jaccard}
+
+files <- list.files(path = "~/Sorger/projects/orion/orion_1_74/pearson/", full.names = TRUE)
+files <- files[grepl("pearson$", files)]
+col_range <- colorRampPalette(c("darkblue", "white", "darkred"))(200)
+
+dtt <- lapply(files, function(f) {
+  cat(basename(f), "\n")
+  dt <- fread(f)
+  
+  bl <- c("Hoechst", "Argo550","AF1")
+  dt <- dt[!V1 %in% bl & !V2 %in% bl]
+  
+  # Visualize using ggplot2
+  g <- ggplot(data = dt, aes(x = V1, y = V2)) +
+  geom_tile(aes(fill = V3), color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), name="Correlation") +
+  #geom_text(aes(label = sprintf("%.2f", value)), vjust = 1) +
+  theme_jw() + ggtitle(sub("\\..*$", "", basename(f))) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), 
+        axis.title.x = element_blank(), axis.title.y = element_blank(), 
+        legend.position = "none")
+  
+ # Create a square matrix of dimensions equal to unique values of V1 and V2
+labels <- unique(c(dt$V1, dt$V2))
+mat <- matrix(0, nrow=length(labels), ncol=length(labels))
+rownames(mat) <- labels
+colnames(mat) <- labels
+
+# Fill the matrix
+for (i in 1:nrow(dt)) {
+  mat[dt$V1[i], dt$V2[i]] <- dt$V3[i]
+  mat[dt$V2[i], dt$V1[i]] <- dt$V3[i]  # since the relationship is symmetric
+}
+  
+  return(list(g=g, mat=mat, name=sub("\\..*$", "", basename(f))))
+})
+save_pdf(gridExtra::grid.arrange(grobs = lapply(dtt, function(x) x$g)), "pearson_facet.pdf", width=30, height=30)
+
+##### NON PARALLEL
+# Calculate pairwise Mantel tests
+n <- length(dtt)
+results <- matrix(NA, n, n)
+rownames(results) <- names(dtt)
+colnames(results) <- names(dtt)
+
+for (i in 1:(n-1)) {
+  cat(i,"\n")
+  for (j in (i+1):n) {
+    test <- mantel(dtt[[i]]$mat, dtt[[j]]$mat, method = "pearson", permutations = 999)
+    results[i, j] <- test$statistic
+    results[j, i] <- test$statistic
+  }
+}
+##########
+
+compute_mantel <- function(pair) {
+  i <- pair[1]
+  j <- pair[2]
+  
+  test <- mantel(dtt[[i]]$mat, dtt[[j]]$mat, method = "pearson", permutations = 999)
+  return(list(i = i, j = j, statistic = test$statistic))
+}
+
+# Create a list of all pairs of indices
+pairs <- list()
+for (i in 1:(n-1)) {
+  for (j in (i+1):n) {
+    pairs <- c(pairs, list(c(i, j)))
+  }
+}
+
+# Determine the number of cores to use; usually one less than all available cores
+num_cores <- detectCores() - 1
+system.time(results_list <- mclapply(pairs, compute_mantel, mc.cores = num_cores))
+
+# extract into results matrix
+results <- matrix(NA, n, n)
+rownames(results) <- sapply(dtt, function(x) x$name)
+colnames(results) <- sapply(dtt, function(x) x$name)
+for (res in results_list) {
+  results[res$i, res$j] <- res$statistic
+  results[res$j, res$i] <- res$statistic
+}
+
+# Plot Mantel similarity matrix
+df_results <- as.data.table(melt(results[!rownames(results) %in% hard_coded_tip, !colnames(results) %in% hard_coded_tip]))
+colnames(df_results) <- c("Matrix1", "Matrix2", "Mantel_r")
+g <- ggplot(df_results, aes(Matrix1, Matrix2, fill = Mantel_r)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(title = "Mantel Test Similarity Matrix", fill = "Mantel r")
+
+library(ComplexUpset)
+
+# 1. Calculate the distance matrix.
+# Given that the results are correlation coefficients (from Mantel test),
+# we can calculate the distance as (1 - correlation coefficient).
+# This makes perfect correlations have a distance of 0 and no correlation a distance of 1.
+dist_matrix <- 1 - abs(results[!rownames(results) %in% hard_coded_tip, !colnames(results) %in% hard_coded_tip])
+
+# 2. Perform hierarchical clustering
+clustering <- hclust(as.dist(dist_matrix))
+dendrogram <- as.dendrogram(clustering)
+
+# 3. Rearrange the results matrix based on clustering order
+order <- order.dendrogram(dendrogram)
+clustered_results <- results[order, order]
+
+# 4. Plot the clustered matrix
+df_clustered_results <- melt(clustered_results)
+colnames(df_clustered_results) <- c("Matrix1", "Matrix2", "Mantel_r")
+
+g <- ggplot(df_clustered_results, aes(Matrix1, Matrix2, fill = Mantel_r)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Clustered Mantel Test Similarity Matrix", fill = "Mantel r")
+
+# Using heatmap.2 for visualization with dendrogram
+save_pdf(heatmap.2(clustered_results, 
+          main = "Clustered Mantel Test Similarity Matrix", 
+          notecol="black",      # change font color of cell labels to black
+          density.info="none",  # turns off density plot inside color legend
+          trace="none",         # turns off trace lines inside the heat map
+          margins =c(8,9),      # widens margins around plot
+          dendrogram = "row",   # only draw a row dendrogram
+          col = colorRampPalette(c("blue", "white", "red"))(25),
+          Colv = NULL),          # keep the column order as it is
+         "mantel_dendrogram_pearson_nontip.pdf", width=20, height=20)
+```
